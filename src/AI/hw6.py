@@ -19,17 +19,19 @@ class AIPlayer(Player):
         
         # TD Learning parameters
         self.alpha = 0.1  # learning rate
-        self.gamma = 0.9  # discount factor
-        self.epsilon = 0.1  # exploration rate
+        self.gamma = 0.9 # discount factor
+        self.epsilon = 0.3  # exploration rate
         
         # State utilities dictionary
         self.state_utilities = {}
         
-        # Episode history for TD updates
-        self.episode_history = []  # list of (state_category, reward) tuples
+        # Track last visited state for online TD updates
+        self.last_state_category = None
+        self.last_reward = None
         
-        # Filename for saving/loading weights
-        self.weights_file = "./weights.txt"
+        # Filename for saving/loading weights (path relative to project src directory)
+        # This makes it independent of the current working directory.
+        self.weights_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "weights.txt")
         
         # Load existing utilities if file exists
         self.load_utilities()
@@ -60,11 +62,30 @@ class AIPlayer(Player):
         num_enemy_ants = len(enemy_inv.ants)
         enemy_ant_bucket = min(num_enemy_ants // 2, 4)
         
-        # Feature 5
+        # Feature 5: my queen alive
         has_queen = any(ant.type == QUEEN for ant in my_inv.ants)
         
-        # Feature 6
+        # Feature 6: enemy queen alive
         enemy_has_queen = any(ant.type == QUEEN for ant in enemy_inv.ants)
+        
+        # Feature 7: number of my workers
+        num_workers = len([ant for ant in my_inv.ants if ant.type == WORKER])
+        worker_bucket = min(num_workers, 3)
+        
+        # Feature 8: is any worker carrying food
+        worker_carrying = any(ant.carrying for ant in my_inv.ants if ant.type == WORKER)
+        
+        # Feature 9: food advantage bucket (bounded difference)
+        food_advantage = max(min(my_food - enemy_food, 5), -5)
+        
+        # Feature 10: enemy threat near my queen (bool)
+        my_queen = my_inv.getQueen()
+        enemy_threat = False
+        if my_queen is not None:
+            for ant in enemy_inv.ants:
+                if approxDist(ant.coords, my_queen.coords) <= 2:
+                    enemy_threat = True
+                    break
         
         # Return tuple
         category = (
@@ -73,7 +94,11 @@ class AIPlayer(Player):
             enemy_food_bucket,
             enemy_ant_bucket,
             has_queen,
-            enemy_has_queen
+            enemy_has_queen,
+            worker_bucket,
+            worker_carrying,
+            food_advantage,
+            enemy_threat
         )
         
         return category
@@ -92,14 +117,55 @@ class AIPlayer(Player):
     
     ## Reward Function
     def get_reward(self, currentState):
+        #Shaping reward that encourages food collection, keeping workers alive,
+        #and protecting the queen. Terminal rewards are handled separately at
+        #the end of the game using the hasWon flag.
+    
         winner = getWinner(currentState)
-        
         if winner == self.playerId:
-            return 1.0  # Win
-        elif winner == 1 - self.playerId:
-            return -1.0  # Loss
-        else:
-            return -0.01  # Small penalty for each turn
+            return 1.0
+        if winner == 1 - self.playerId:
+            return -1.0
+        
+        me = self.playerId
+        enemy = 1 - me
+        my_inv = currentState.inventories[me]
+        enemy_inv = currentState.inventories[enemy]
+        
+        reward = -0.01  # baseline time penalty
+        
+        # Reward holding a food advantage
+        food_advantage = my_inv.foodCount - enemy_inv.foodCount
+        reward += 0.02 * food_advantage
+        
+        # Encourage building/maintaining workers and carrying food
+        workers = [ant for ant in my_inv.ants if ant.type == WORKER]
+        if not workers:
+            reward -= 0.05
+        if any(worker.carrying for worker in workers):
+            reward += 0.05
+        
+        # Penalize letting the enemy threaten our queen
+        my_queen = my_inv.getQueen()
+        if my_queen is not None:
+            if any(approxDist(ant.coords, my_queen.coords) <= 1 for ant in enemy_inv.ants):
+                reward -= 0.1
+        
+        return reward
+
+
+    def _apply_td_update(self, next_state_category):
+        #Perform a TD(0) update using the last recorded state/reward and the
+        #estimated value of the next state.
+        if self.last_state_category is None or self.last_reward is None:
+            return
+        
+        current_utility = self.get_utility(self.last_state_category)
+        next_utility = self.get_utility(next_state_category)
+        td_target = self.last_reward + self.gamma * next_utility
+        td_error = td_target - current_utility
+        new_utility = current_utility + self.alpha * td_error
+        self.update_utility(self.last_state_category, new_utility)
     
     
     ## Save/Load Utilities
@@ -173,7 +239,13 @@ class AIPlayer(Player):
         # Get current state category and record it
         current_category = self.categorize_state(currentState)
         current_reward = self.get_reward(currentState)
-        self.episode_history.append((current_category, current_reward))
+        
+        # Update previous state's utility estimate with the new information
+        self._apply_td_update(current_category)
+        
+        # Remember this state for the next update
+        self.last_state_category = current_category
+        self.last_reward = current_reward
         
         # Epsilon-greedy exploration
         if random.random() < self.epsilon:
@@ -185,8 +257,6 @@ class AIPlayer(Player):
             best_utility = float('-inf')
             
             for move in moves:
-                # Predict next state (you may need to implement this)
-                # For now, we'll use a simplified approach
                 next_state = self.predict_state(currentState, move)
                 next_category = self.categorize_state(next_state)
                 next_utility = self.get_utility(next_category)
@@ -203,14 +273,22 @@ class AIPlayer(Player):
         
         # Don't build if we have 3+ ants (simple heuristic)
         numAnts = len(currentState.inventories[currentState.whoseTurn].ants)
-        while Move.moveType == BUILD and numAnts >= 3 and len(moves) > 1:
-            selected_move = moves[random.randint(0, len(moves) - 1)]
+        if numAnts >= 3:
+            # Prefer non-build moves when we already have enough ants
+            non_build_moves = [m for m in moves if m.moveType != BUILD]
+            if non_build_moves:
+                selected_move = random.choice(non_build_moves)
         
         return selected_move
     
     
     def predict_state(self, currentState, move):
-        return currentState
+        """
+        Predict the next state resulting from taking the given move.
+        Uses the helper from AIPlayerUtils which returns a fast-cloned
+        next state with updated inventories.
+        """
+        return getNextState(currentState, move)
     
     
     ## Attack Selection
@@ -221,37 +299,24 @@ class AIPlayer(Player):
     
     ## TD Learning Update at End of Game
     def registerWin(self, hasWon):
-        """
-        Called at end of game. Update utilities using TD learning.
-        """
+        #Called at end of game. Apply the final TD update with the terminal
+        #reward and persist learned utilities.
         print(f"Game ended. Result: {'WIN' if hasWon else 'LOSS'}")
         
-        # Perform TD updates backward through episode
-        for i in range(len(self.episode_history) - 1):
-            state_cat, reward = self.episode_history[i]
-            next_state_cat, next_reward = self.episode_history[i + 1]
-            
-            # TD Update: U(s) = U(s) + α[R + γ*U(s') - U(s)]
-            current_utility = self.get_utility(state_cat)
-            next_utility = self.get_utility(next_state_cat)
-            
-            td_target = reward + self.gamma * next_utility
-            td_error = td_target - current_utility
-            new_utility = current_utility + self.alpha * td_error
-            
-            self.update_utility(state_cat, new_utility)
+        final_reward = 1.0 if hasWon else -1.0
         
-        # Handle final state (terminal state has no next state)
-        if self.episode_history:
-            final_state_cat, final_reward = self.episode_history[-1]
-            current_utility = self.get_utility(final_state_cat)
-            new_utility = current_utility + self.alpha * (final_reward - current_utility)
-            self.update_utility(final_state_cat, new_utility)
+        if self.last_state_category is not None:
+            total_reward = (self.last_reward if self.last_reward is not None else 0.0) + final_reward
+            current_utility = self.get_utility(self.last_state_category)
+            td_error = total_reward - current_utility
+            new_utility = current_utility + self.alpha * td_error
+            self.update_utility(self.last_state_category, new_utility)
         
         # Save utilities after each game
         self.save_utilities()
         
-        # Clear episode history for next game
-        self.episode_history = []
+        # Reset TD tracking for next game
+        self.last_state_category = None
+        self.last_reward = None
         
         print(f"Total states learned: {len(self.state_utilities)}")
