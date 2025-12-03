@@ -271,14 +271,6 @@ class AIPlayer(Player):
             
             selected_move = best_move if best_move else moves[0]
         
-        # Don't build if we have 3+ ants (simple heuristic)
-        numAnts = len(currentState.inventories[currentState.whoseTurn].ants)
-        if numAnts >= 3:
-            # Prefer non-build moves when we already have enough ants
-            non_build_moves = [m for m in moves if m.moveType != BUILD]
-            if non_build_moves:
-                selected_move = random.choice(non_build_moves)
-        
         return selected_move
     
     
